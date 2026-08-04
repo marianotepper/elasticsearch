@@ -93,6 +93,14 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     private volatile boolean timeExceeded = false;
 
+    // whether a segment that alone exceeds the per-slice document floor may be split into partitions in
+    // #computeSlices instead of becoming an oversized slice of its own (see #153083). Defaults to false,
+    // matching the pre-existing whole-segment-only slicing, since a partitioned segment gets its
+    // LeafCollector#getLeafCollector invoked once per partition and its aggregations post-collected once
+    // per slice -- something aggregations don't support. Callers that know the request has no aggregations
+    // may opt in via #setAllowSegmentPartitions, before the first call that triggers slice computation.
+    private volatile boolean allowSegmentPartitions = false;
+
     /** constructor for non-concurrent search */
     @SuppressWarnings("this-escape")
     public ContextIndexSearcher(
@@ -164,13 +172,22 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     @Override
     protected LeafSlice[] slices(List<LeafReaderContext> leaves) {
         // we offload to the executor unconditionally, including requests that don't support concurrency
-        LeafSlice[] leafSlices = computeSlices(getLeafContexts(), maximumNumberOfSlices, minimumDocsPerSlice);
+        LeafSlice[] leafSlices = computeSlices(getLeafContexts(), maximumNumberOfSlices, minimumDocsPerSlice, allowSegmentPartitions);
         assert leafSlices.length <= maximumNumberOfSlices : "more slices created than the maximum allowed";
         return leafSlices;
     }
 
     public void setProfiler(QueryProfiler profiler) {
         this.profiler = profiler;
+    }
+
+    /**
+     * Opts this searcher into intra-segment slicing (see {@link #allowSegmentPartitions}). Must be called,
+     * if at all, before the first search/count call, since slices are computed lazily on first use and then
+     * cached for the lifetime of this searcher.
+     */
+    public void setAllowSegmentPartitions(boolean allowSegmentPartitions) {
+        this.allowSegmentPartitions = allowSegmentPartitions;
     }
 
     public void setCircuitBreaker(@Nullable CircuitBreaker circuitBreaker) {
@@ -367,6 +384,25 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      * of {@link LeafSlice} will be equal or lower than the max number of slices.
      */
     public static LeafSlice[] computeSlices(List<LeafReaderContext> leaves, int maxSliceNum, int minDocsPerSlice) {
+        return computeSlices(leaves, maxSliceNum, minDocsPerSlice, false);
+    }
+
+    /**
+     * Same as {@link #computeSlices(List, int, int)}, but when <code>allowSegmentPartitions</code> is
+     * {@code true}, a segment that alone holds more docs than the per-slice floor is split into
+     * partitions of roughly that same size, each becoming its own slice, instead of becoming an
+     * oversized slice of its own. This keeps a single large segment from single-handedly setting the
+     * query's latency floor (see #153083), at the cost of a {@link Collector} potentially getting
+     * {@link Collector#getLeafCollector(LeafReaderContext)} called more than once for the same leaf.
+     * Callers with per-leaf state that doesn't tolerate that -- aggregations, in practice -- must pass
+     * {@code false}.
+     */
+    public static LeafSlice[] computeSlices(
+        List<LeafReaderContext> leaves,
+        int maxSliceNum,
+        int minDocsPerSlice,
+        boolean allowSegmentPartitions
+    ) {
         if (maxSliceNum < 1) {
             throw new IllegalArgumentException("maxSliceNum must be >= 1 (got " + maxSliceNum + ")");
         }
@@ -385,22 +421,35 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // percentage of documents per slice, minimum 10%
         final double percentageDocsPerThread = Math.max(MINIMUM_DOCS_PERCENT_PER_SLICE, 1.0 / maxSliceNum);
         // compute slices
-        return computeSlices(leaves, Math.max(minDocsPerSlice, (int) (percentageDocsPerThread * numDocs)));
+        return computeSlices(leaves, Math.max(minDocsPerSlice, (int) (percentageDocsPerThread * numDocs)), allowSegmentPartitions);
     }
 
-    private static LeafSlice[] computeSlices(List<LeafReaderContext> leaves, int minDocsPerSlice) {
+    private static LeafSlice[] computeSlices(List<LeafReaderContext> leaves, int minDocsPerSlice, boolean allowSegmentPartitions) {
         // Make a copy so we can sort:
         List<LeafReaderContext> sortedLeaves = new ArrayList<>(leaves);
         // Sort by maxDoc, descending:
         sortedLeaves.sort((c1, c2) -> Integer.compare(c2.reader().maxDoc(), c1.reader().maxDoc()));
         // we add the groups on a priority queue, so we can add orphan leafs to the smallest group
-        final PriorityQueue<List<LeafReaderContext>> queue = new PriorityQueue<>(
+        final PriorityQueue<List<LeafReaderContextPartition>> queue = new PriorityQueue<>(
             (c1, c2) -> Integer.compare(sumMaxDocValues(c1), sumMaxDocValues(c2))
         );
         long docSum = 0;
-        List<LeafReaderContext> group = new ArrayList<>();
+        List<LeafReaderContextPartition> group = new ArrayList<>();
         for (LeafReaderContext ctx : sortedLeaves) {
-            group.add(ctx);
+            // sortedLeaves is sorted by descending maxDoc, so an oversized segment is always encountered
+            // right at the start of a new group, before anything else has been added to it.
+            if (allowSegmentPartitions && group.isEmpty()) {
+                // floor division: guarantees each partition holds at least minDocsPerSlice docs, same as
+                // every other slice produced below, so the overall slice count bound is unaffected.
+                int numPartitions = ctx.reader().maxDoc() / minDocsPerSlice;
+                if (numPartitions > 1) {
+                    for (LeafReaderContextPartition partition : partitionSegment(ctx, numPartitions)) {
+                        queue.add(new ArrayList<>(List.of(partition)));
+                    }
+                    continue;
+                }
+            }
+            group.add(LeafReaderContextPartition.createForEntireSegment(ctx));
             docSum += ctx.reader().maxDoc();
             if (docSum > minDocsPerSlice) {
                 queue.add(group);
@@ -409,13 +458,13 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             }
         }
 
-        if (group.size() > 0) {
-            if (queue.size() == 0) {
+        if (group.isEmpty() == false) {
+            if (queue.isEmpty()) {
                 queue.add(group);
             } else {
-                for (LeafReaderContext context : group) {
-                    final List<LeafReaderContext> head = queue.poll();
-                    head.add(context);
+                for (LeafReaderContextPartition partition : group) {
+                    final List<LeafReaderContextPartition> head = queue.poll();
+                    head.add(partition);
                     queue.add(head);
                 }
             }
@@ -423,23 +472,39 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         final LeafSlice[] slices = new LeafSlice[queue.size()];
         int upto = 0;
-        for (List<LeafReaderContext> currentLeaf : queue) {
+        for (List<LeafReaderContextPartition> currentSlice : queue) {
             // LeafSlice ctor reorders leaves so that leaves within a slice preserve the order they had within the IndexReader.
             // This is important given how Elasticsearch sorts leaves by descending @timestamp to get better query performance.
-            slices[upto++] = new LeafSlice(
-                currentLeaf.stream()
-                    .map(LeafReaderContextPartition::createForEntireSegment)
-                    .collect(Collectors.toCollection(ArrayList::new))
-            );
+            slices[upto++] = new LeafSlice(currentSlice);
         }
 
         return slices;
     }
 
-    private static int sumMaxDocValues(List<LeafReaderContext> l) {
+    /**
+     * Splits {@code ctx} into {@code numPartitions} contiguous, roughly equal-sized partitions covering
+     * the whole segment. The last partition absorbs the remainder of the division.
+     */
+    private static List<LeafReaderContextPartition> partitionSegment(LeafReaderContext ctx, int numPartitions) {
+        int maxDoc = ctx.reader().maxDoc();
+        int docsPerPartition = maxDoc / numPartitions;
+        List<LeafReaderContextPartition> partitions = new ArrayList<>(numPartitions);
+        int minDocId = 0;
+        for (int i = 0; i < numPartitions - 1; i++) {
+            int maxDocId = minDocId + docsPerPartition;
+            partitions.add(LeafReaderContextPartition.createFromAndTo(ctx, minDocId, maxDocId));
+            minDocId = maxDocId;
+        }
+        partitions.add(LeafReaderContextPartition.createFromAndTo(ctx, minDocId, maxDoc));
+        return partitions;
+    }
+
+    private static int sumMaxDocValues(List<LeafReaderContextPartition> partitions) {
         int sum = 0;
-        for (LeafReaderContext lr : l) {
-            sum += lr.reader().maxDoc();
+        for (LeafReaderContextPartition partition : partitions) {
+            sum += partition.maxDocId == DocIdSetIterator.NO_MORE_DOCS
+                ? partition.ctx.reader().maxDoc()
+                : partition.maxDocId - partition.minDocId;
         }
         return sum;
     }

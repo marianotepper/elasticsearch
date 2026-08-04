@@ -15,8 +15,13 @@ import org.apache.lucene.search.FilterLeafCollector;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TotalHitCountCollector;
+import org.apache.lucene.util.ThreadInterruptedException;
 
 import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -27,10 +32,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 class PartialHitCountCollector extends TotalHitCountCollector {
 
     private final HitsThresholdChecker hitsThresholdChecker;
+    // Non-null only when the search may target more than one partition of the same segment, i.e. when
+    // ContextIndexSearcher#computeSlices split an oversized segment into several LeafReaderContextPartitions
+    // (see #153083). Coordinates across the collector instances (one per slice, potentially running
+    // concurrently) so that a segment split into partitions only ever contributes its count once: without
+    // this, Weight#count(LeafReaderContext) -- which returns the count for the *whole* segment, oblivious to
+    // partition bounds -- would otherwise be added once per partition. Mirrors the coordination Lucene's own
+    // TotalHitCountCollectorManager applies for the same reason.
+    private final Map<Object, Future<Boolean>> earlyTerminatedMap;
     private boolean earlyTerminated;
 
     PartialHitCountCollector(HitsThresholdChecker hitsThresholdChecker) {
+        this(hitsThresholdChecker, null);
+    }
+
+    PartialHitCountCollector(HitsThresholdChecker hitsThresholdChecker, Map<Object, Future<Boolean>> earlyTerminatedMap) {
         this.hitsThresholdChecker = hitsThresholdChecker;
+        this.earlyTerminatedMap = earlyTerminatedMap;
     }
 
     @Override
@@ -41,10 +59,10 @@ class PartialHitCountCollector extends TotalHitCountCollector {
     @Override
     public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
         if (hitsThresholdChecker.totalHitsThreshold == Integer.MAX_VALUE) {
-            return super.getLeafCollector(context);
+            return countingLeafCollector(context);
         }
         earlyTerminateIfNeeded();
-        return new FilterLeafCollector(super.getLeafCollector(context)) {
+        return new FilterLeafCollector(countingLeafCollector(context)) {
             @Override
             public void collect(int doc) throws IOException {
                 earlyTerminateIfNeeded();
@@ -52,6 +70,50 @@ class PartialHitCountCollector extends TotalHitCountCollector {
                 super.collect(doc);
             }
         };
+    }
+
+    /**
+     * Delegates to {@link TotalHitCountCollector#getLeafCollector(LeafReaderContext)}, which may throw
+     * {@link CollectionTerminatedException} right away if {@code Weight#count} can answer the whole segment's
+     * count without collecting. When {@link #earlyTerminatedMap} is set, only the first partition of a given
+     * leaf actually makes that call; later partitions of the same leaf replay its outcome (both the count and
+     * the early termination) instead of repeating -- and so redundantly counting -- the whole-segment shortcut.
+     */
+    private LeafCollector countingLeafCollector(LeafReaderContext context) throws IOException {
+        if (earlyTerminatedMap == null) {
+            return super.getLeafCollector(context);
+        }
+        Future<Boolean> earlyTerminated = earlyTerminatedMap.get(context.id());
+        if (earlyTerminated == null) {
+            CompletableFuture<Boolean> firstEarlyTerminated = new CompletableFuture<>();
+            Future<Boolean> previousEarlyTerminated = earlyTerminatedMap.putIfAbsent(context.id(), firstEarlyTerminated);
+            if (previousEarlyTerminated == null) {
+                // first partition of this leaf gets to decide what subsequent partitions of it do
+                try {
+                    LeafCollector leafCollector = super.getLeafCollector(context);
+                    firstEarlyTerminated.complete(false);
+                    return leafCollector;
+                } catch (CollectionTerminatedException e) {
+                    firstEarlyTerminated.complete(true);
+                    throw e;
+                }
+            }
+            earlyTerminated = previousEarlyTerminated;
+        }
+        try {
+            if (earlyTerminated.get()) {
+                // the first partition of this leaf got its count from Weight#count and terminated right away;
+                // do the same here rather than counting (part of) the same segment a second time
+                throw new CollectionTerminatedException();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ThreadInterruptedException(e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+        // the first partition of this leaf couldn't shortcut and is collecting docs for real; do the same here
+        return createLeafCollector();
     }
 
     private void earlyTerminateIfNeeded() {

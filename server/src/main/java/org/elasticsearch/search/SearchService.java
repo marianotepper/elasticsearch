@@ -2297,6 +2297,10 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             }
             context.queryPhaseRankShardContext(source.rankBuilder().buildQueryPhaseShardContext(queries, context.from()));
         }
+        // Aggregations post-collect once per slice and re-invoke their leaf collector once per partition of
+        // a given segment, neither of which they support, so intra-segment slicing is only safe to opt into
+        // once we know for sure that this request has none (see #153083).
+        context.searcher().setAllowSegmentPartitions(context.aggregations() == null);
     }
 
     /**

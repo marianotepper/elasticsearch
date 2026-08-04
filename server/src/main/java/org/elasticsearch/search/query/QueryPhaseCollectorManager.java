@@ -26,6 +26,7 @@ import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MultiCollector;
 import org.apache.lucene.search.Query;
@@ -66,6 +67,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 
 import static org.elasticsearch.search.profile.query.CollectorResult.REASON_AGGREGATION;
 import static org.elasticsearch.search.profile.query.CollectorResult.REASON_SEARCH_QUERY_PHASE;
@@ -230,7 +234,8 @@ abstract class QueryPhaseCollectorManager implements CollectorManager<Collector,
                 searchContext.minimumScore(),
                 searchContext.getProfilers() != null,
                 searchContext.sort(),
-                searchContext.trackTotalHitsUpTo()
+                searchContext.trackTotalHitsUpTo(),
+                hasSegmentPartitions(searchContext.searcher().getSlices())
             );
         }
         // top collectors don't like a size of 0
@@ -308,6 +313,11 @@ abstract class QueryPhaseCollectorManager implements CollectorManager<Collector,
     private static final class EmptyHits extends QueryPhaseCollectorManager {
         private final PartialHitCountCollector.HitsThresholdChecker hitsThresholdChecker;
         private final SortAndFormats sortAndFormats;
+        // Non-null only when the searcher may target more than one partition of the same segment. Shared
+        // across the PartialHitCountCollector instances created for each slice so a partitioned segment's
+        // count -- which Weight#count(LeafReaderContext) reports for the whole segment -- is only ever
+        // added once instead of once per partition (see #153083 and PartialHitCountCollector).
+        private final Map<Object, Future<Boolean>> earlyTerminatedMap;
 
         EmptyHits(
             Weight postFilterWeight,
@@ -316,18 +326,20 @@ abstract class QueryPhaseCollectorManager implements CollectorManager<Collector,
             Float minScore,
             boolean profile,
             @Nullable SortAndFormats sortAndFormats,
-            int trackTotalHitsUpTo
+            int trackTotalHitsUpTo,
+            boolean hasSegmentPartitions
         ) {
             super(postFilterWeight, terminateAfterChecker, aggsCollectorManager, minScore, profile);
             this.sortAndFormats = sortAndFormats;
             this.hitsThresholdChecker = new PartialHitCountCollector.HitsThresholdChecker(
                 trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED ? 0 : trackTotalHitsUpTo
             );
+            this.earlyTerminatedMap = hasSegmentPartitions ? new ConcurrentHashMap<>() : null;
         }
 
         @Override
         protected PartialHitCountCollector newTopDocsCollector() {
-            return new PartialHitCountCollector(hitsThresholdChecker);
+            return new PartialHitCountCollector(hitsThresholdChecker, earlyTerminatedMap);
         }
 
         @Override
@@ -657,6 +669,22 @@ abstract class QueryPhaseCollectorManager implements CollectorManager<Collector,
         } else {
             return -1;
         }
+    }
+
+    /**
+     * Returns true if any slice targets a partition of a segment rather than the whole segment, i.e. if
+     * {@link org.elasticsearch.search.internal.ContextIndexSearcher#computeSlices} split an oversized
+     * segment into several {@link IndexSearcher.LeafReaderContextPartition}s (see #153083).
+     */
+    private static boolean hasSegmentPartitions(IndexSearcher.LeafSlice[] leafSlices) {
+        for (IndexSearcher.LeafSlice leafSlice : leafSlices) {
+            for (IndexSearcher.LeafReaderContextPartition partition : leafSlice.partitions) {
+                if (partition.minDocId > 0 || partition.maxDocId < partition.ctx.reader().maxDoc()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

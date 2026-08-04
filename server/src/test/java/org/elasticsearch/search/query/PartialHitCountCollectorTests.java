@@ -14,6 +14,7 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.CollectionTerminatedException;
@@ -24,6 +25,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
@@ -34,6 +36,10 @@ import org.junit.Before;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 
 import static org.elasticsearch.search.query.PartialHitCountCollector.HitsThresholdChecker;
 
@@ -178,6 +184,72 @@ public class PartialHitCountCollectorTests extends ESTestCase {
         Result result = searcher.search(query, collectorManager);
         assertEquals(1, result.totalHits);
         assertFalse(result.terminatedAfter);
+    }
+
+    /**
+     * A segment split into several {@link IndexSearcher.LeafReaderContextPartition}s of the same leaf gets its
+     * {@link PartialHitCountCollector#getLeafCollector} called once per partition. Without the
+     * {@code earlyTerminatedMap} coordination, {@link Weight#count(LeafReaderContext)} -- which reports the
+     * whole segment's count, oblivious to partition bounds -- would be added once per partition instead of
+     * once per segment (see #153083).
+     */
+    public void testPartitionedSegmentCountedOnce() throws Exception {
+        try (Directory partitionedDir = newDirectory()) {
+            try (
+                RandomIndexWriter writer = new RandomIndexWriter(
+                    random(),
+                    partitionedDir,
+                    newIndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE)
+                )
+            ) {
+                int docs = randomIntBetween(4, 20);
+                for (int i = 0; i < docs; i++) {
+                    Document doc = new Document();
+                    doc.add(new StringField("string", "match", Field.Store.NO));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+                try (IndexReader partitionedReader = writer.getReader()) {
+                    assertEquals("expected a single segment", 1, partitionedReader.leaves().size());
+                    LeafReaderContext ctx = partitionedReader.leaves().get(0);
+                    IndexSearcher partitionedSearcher = newSearcher(partitionedReader);
+                    Query query = new TermQuery(new Term("string", "match"));
+                    Weight weight = query.createWeight(partitionedSearcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
+
+                    Map<Object, Future<Boolean>> earlyTerminatedMap = new ConcurrentHashMap<>();
+                    HitsThresholdChecker hitsThresholdChecker = NO_OVERHEAD_HITS_CHECKER;
+                    int mid = docs / 2;
+                    IndexSearcher.LeafReaderContextPartition first = IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, mid);
+                    IndexSearcher.LeafReaderContextPartition second = IndexSearcher.LeafReaderContextPartition.createFromAndTo(
+                        ctx,
+                        mid,
+                        docs
+                    );
+
+                    int totalHits = 0;
+                    for (IndexSearcher.LeafReaderContextPartition partition : List.of(first, second)) {
+                        PartialHitCountCollector collector = new PartialHitCountCollector(hitsThresholdChecker, earlyTerminatedMap);
+                        collector.setWeight(weight);
+                        try {
+                            LeafCollector leafCollector = collector.getLeafCollector(partition.ctx);
+                            BulkScorer bulkScorer = weight.bulkScorer(partition.ctx);
+                            if (bulkScorer != null) {
+                                bulkScorer.score(
+                                    leafCollector,
+                                    partition.ctx.reader().getLiveDocs(),
+                                    partition.minDocId,
+                                    partition.maxDocId
+                                );
+                            }
+                        } catch (CollectionTerminatedException e) {
+                            // the whole segment's count was already retrieved via Weight#count, nothing left to collect
+                        }
+                        totalHits += collector.getTotalHits();
+                    }
+                    assertEquals(docs, totalHits);
+                }
+            }
+        }
     }
 
     public void testScoreModeEarlyTermination() {
